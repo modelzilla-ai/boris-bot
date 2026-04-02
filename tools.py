@@ -197,67 +197,165 @@ def _parse_rss(xml_text: str, max_items: int = 3) -> List[dict]:
         pass
     return items
 
+from typing import List
+from datetime import datetime
+
+
 def fetch_bitcoin_news(max_news: int = 3) -> List[dict]:
     """
-    Retorna lista de notícias, cada uma com campo 'sentiment' (score de -1 a 1).
+    Retorna lista de notícias agregadas de múltiplos feeds,
+    com sentimento (-1 a 1), sem duplicatas e ordenadas por data.
     """
     collected = []
+
+    # 📊 balanceamento por fonte
+    per_feed = max(1, max_news // len(RSS_FEEDS))
+
     for feed_url in RSS_FEEDS:
-        if len(collected) >= max_news:
-            break
         try:
             resp = requests.get(feed_url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
-            items = _parse_rss(resp.text, max_items=max_news - len(collected))
+
+            items = _parse_rss(resp.text, max_items=per_feed)
             source = feed_url.split("/")[2]
+
             for item in items:
                 item["source"] = source
+
+                # garantir campo de data
+                item["published"] = item.get("published", datetime.min)
+
                 collected.append(item)
+
             logger.info("%d notícias de %s", len(items), source)
+
         except Exception as e:
             logger.warning("Falha no feed %s: %s", feed_url, e)
-    # Adicionar sentimento
-    if collected:
-        texts = [f"{n['title']} {n.get('summary','')}" for n in collected]
-        sentiments = analyze_sentiment(texts)
-        for i, n in enumerate(collected):
-            n['sentiment'] = sentiments[i]
-    return collected[:max_news]
+
+    # 🧹 remover duplicadas (por título)
+    seen = set()
+    unique = []
+
+    for n in collected:
+        title_key = n["title"].strip().lower()
+        if title_key not in seen:
+            unique.append(n)
+            seen.add(title_key)
+
+    # ⏱️ ordenar por data (mais recente primeiro)
+    unique.sort(key=lambda x: x.get("published", datetime.min), reverse=True)
+
+    # ✂️ limitar total
+    final_news = unique[:max_news]
+
+    # 🧠 sentimento
+    if final_news:
+        texts = [f"{n['title']} {n.get('summary','')}" for n in final_news]
+
+        try:
+            sentiments = analyze_sentiment(texts)
+            for i, n in enumerate(final_news):
+                n["sentiment"] = sentiments[i]
+        except Exception as e:
+            logger.warning("Erro ao calcular sentimento: %s", e)
+            for n in final_news:
+                n["sentiment"] = 0.0
+
+    logger.info("Total final de notícias: %d", len(final_news))
+
+    return final_news
 
 # ----------------------------------------------
 # Gráficos
 # ----------------------------------------------
+import numpy as np
+from datetime import datetime, timedelta, timezone
+
 def generate_price_chart(price_history: List[dict]) -> Optional[BytesIO]:
     """
-    Gera gráfico de preço (últimos 7 dias) a partir do histórico.
-    Retorna BytesIO contendo a imagem PNG.
+    Gráfico das últimas 24h com:
+    - preço BTC
+    - tendência polinomial + seno
     """
     if not price_history:
         return None
+
     df = pd.DataFrame(price_history)
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+
+    # 🧠 filtrar últimas 24h
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    df = df[df['timestamp'] >= cutoff]
+
+    if df.empty:
+        return None
+
     df.sort_values('timestamp', inplace=True)
+
+    # eixo numérico (tempo em horas)
+    t0 = df['timestamp'].iloc[0]
+    df['t'] = (df['timestamp'] - t0).dt.total_seconds() / 3600.0
+
+    x = df['t'].values
+    y = df['price_usd'].values
+
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(df['timestamp'], df['price_usd'], label='Preço', color='blue', linewidth=2)
-    # Médias móveis se houver dados suficientes
-    if len(df) >= 7:
-        df['sma7'] = df['price_usd'].rolling(7).mean()
-        ax.plot(df['timestamp'], df['sma7'], label='MM7', linestyle='--', color='orange')
-    if len(df) >= 25:
-        df['sma25'] = df['price_usd'].rolling(25).mean()
-        ax.plot(df['timestamp'], df['sma25'], label='MM25', linestyle='--', color='red')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-    ax.set_title('Preço Bitcoin (USD)')
-    ax.set_xlabel('Data')
+
+    # 📈 preço real
+    ax.plot(df['timestamp'], y, label='BTC', linewidth=2)
+
+    # 🧮 tendência polinomial (grau 2)
+    if len(x) >= 5:
+        coeffs = np.polyfit(x, y, deg=2)
+        poly = np.poly1d(coeffs)
+        y_poly = poly(x)
+
+        # 📈 seno sobre resíduo
+        residuals = y - y_poly
+
+        try:
+            # frequência básica
+            freq = 2 * np.pi / max(x.max(), 1e-6)
+            sine = np.sin(freq * x)
+
+            # ajustar amplitude
+            amp = np.std(residuals)
+            y_sine = amp * sine
+
+            # combinar
+            y_trend = y_poly + y_sine
+
+            ax.plot(df['timestamp'], y_trend,
+                    linestyle='--',
+                    linewidth=2,
+                    label='Tendência (poly + sine)')
+
+        except Exception:
+            # fallback só poly
+            ax.plot(df['timestamp'], y_poly,
+                    linestyle='--',
+                    linewidth=2,
+                    label='Tendência (poly)')
+
+    # 🕒 eixo X
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
+
+    ax.set_title('Bitcoin (USD) — Últimas 24h')
+    ax.set_xlabel('Hora (UTC)')
     ax.set_ylabel('Preço')
+
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.autofmt_xdate()
+
     buf = BytesIO()
     plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
     buf.seek(0)
     plt.close(fig)
+
     return buf
 
 # ----------------------------------------------

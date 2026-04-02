@@ -210,16 +210,90 @@ def analyze_with_rules(price_data: dict, news_list: list[dict], indicators: dict
             trend, confidence = "Neutra", "Alta"
             rec = "Mercado sem direção definida. Aguarde catalisadores."
 
-    reasoning = f"Regras: variação {change:+.2f}%, sentimento médio {avg_sentiment:+.2f}, RSI={rsi:.2f if rsi else 'N/A'}."
+    rsi_text = f"{rsi:.2f}" if rsi is not None else "N/A"
+
+    reasoning = (
+        f"Regras: variação {change:+.2f}%, "
+        f"sentimento médio {avg_sentiment:+.2f}, "
+        f"RSI={rsi_text}."
+)
     return AnalysisResult(trend, rec, confidence, reasoning, used_llm=False)
+
+import time
+import random
+import os
+
+# memória simples em runtime
+_last_llm_time = 0
+
+
+def _should_use_llm(price_data: dict, indicators: dict) -> bool:
+    """
+    Decide se vale a pena usar LLM baseado no mercado.
+    """
+    change = abs(price_data.get("change_24h", 0))
+
+    # movimento forte
+    if change >= 2.5:
+        return True
+
+    # RSI extremo
+    if indicators:
+        rsi = indicators.get("rsi")
+        if rsi is not None and (rsi >= 70 or rsi <= 30):
+            return True
+
+    return False
+
+
+def _cooldown_ok(cooldown_seconds: int) -> bool:
+    global _last_llm_time
+    now = time.time()
+
+    if now - _last_llm_time >= cooldown_seconds:
+        _last_llm_time = now
+        return True
+
+    return False
+
 
 def run_analysis(price_data: dict, news_list: list[dict], price_trend_summary: str,
                  decision_summary: str, model_name: str, indicators: dict = None,
                  max_new_tokens: int = 400) -> AnalysisResult:
-    result = analyze_with_llm(price_data, news_list, price_trend_summary, decision_summary,
-                              model_name, indicators, max_new_tokens)
-    if result:
-        logger.info("LLM: tendência=%s confiança=%s", result.trend, result.confidence)
-        return result
-    logger.warning("LLM indisponível, usando regras.")
+
+    #LLM totalmente desligado
+    if model_name in (None, "", "none", "None"):
+        logger.info("LLM desativado. Usando regras.")
+        return analyze_with_rules(price_data, news_list, indicators)
+
+    #parâmetros configuráveis
+    USE_LLM_PROB = float(os.getenv("LLM_PROBABILITY", "0.3"))  # 30%
+    COOLDOWN = int(os.getenv("LLM_COOLDOWN_SECONDS", "3600"))  # 1h
+
+    #decisão inteligente
+    use_llm = False
+
+    if _should_use_llm(price_data, indicators):
+        if random.random() < USE_LLM_PROB:
+            if _cooldown_ok(COOLDOWN):
+                use_llm = True
+
+    if use_llm:
+        logger.info("Usando LLM (evento + probabilidade + cooldown)")
+        try:
+            result = analyze_with_llm(
+                price_data, news_list, price_trend_summary,
+                decision_summary, model_name, indicators, max_new_tokens
+            )
+
+            if result:
+                logger.info("LLM: tendência=%s confiança=%s",
+                            result.trend, result.confidence)
+                return result
+
+        except Exception as e:
+            logger.warning("Erro no LLM: %s", e)
+
+    #fallback leve
+    logger.info("Usando regras.")
     return analyze_with_rules(price_data, news_list, indicators)

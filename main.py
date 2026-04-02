@@ -142,7 +142,9 @@ def build_report(price_data: dict, news_list: list[dict], result: AnalysisResult
         f"<b>Tendência:</b> {trend_label}\n"
         f"<b>Confiança:</b> {result.confidence}\n\n"
         f"<b>Recomendação:</b>\n<i>{result.recommendation}</i>\n\n"
-        f"<i>Análise via {mode_label} | Boris v2.0</i>"
+        f"<i>Análise via {mode_label} | Boris v2.0</i>\n"
+        f"<i>Eu sou o Bóris — o bot de análise de Bitcoin programado por "
+        f"<b>Eduardo Araujo (@lalo_araujo)</b> — meu painho. 😊</i>"
     )
     return report
 
