@@ -1,0 +1,37 @@
+# ============================================================
+# Dependências do Agente Bóris
+# Instale com: pip install -r requirements.txt
+# ============================================================
+
+# HTTP e parsing
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Variáveis de ambiente
+python-dotenv>=1.0.0
+
+# Telegram Bot (agora com suporte a comandos)
+python-telegram-bot>=20.0
+
+# Modelo de linguagem open-source (CPU)
+torch>=2.0.0
+transformers>=4.35.0
+accelerate>=0.24.0
+
+# Análise de sentimento (modelo pequeno)
+transformers[torch]  # já incluído
+sentencepiece        # necessário para alguns tokenizers
+
+# Gráficos
+matplotlib>=3.5.0
+
+# Banco de dados (SQLite já é nativo, mas usaremos SQLAlchemy opcionalmente)
+# sqlalchemy>=2.0.0
+
+# Utilitários de retry
+tenacity>=8.2.0
+
+# Para indicadores técnicos (opcional)
+pandas>=1.5.0
+ta>=0.10.0
