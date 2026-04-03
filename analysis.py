@@ -1,18 +1,22 @@
 """
-analysis.py -- Motor de análise com LLM melhorado
-==================================================
-Adicionado:
-- Prompt com chain-of-thought e few-shot example
-- Inclusão do score de sentimento das notícias no prompt
-- Fallback com regras usando RSI e sentimento real
+analysis.py -- Motor de análise do Boris v3
+============================================
+Lógica de decisão completamente reescrita:
+- Regras baseadas em score ponderado (change_24h + RSI + sentimento + tendência histórica)
+- Tendência nunca contradiz queda com sentimento positivo isolado
+- LLM como camada de refinamento, não substituição
+- Confiança calculada por consenso dos sinais
 """
 
 import logging
 import re
+import time
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AnalysisResult:
@@ -21,9 +25,15 @@ class AnalysisResult:
     confidence: str      # "Alta", "Media", "Baixa"
     reasoning: str
     used_llm: bool
+    score: float = 0.0   # score interno [-1, 1] para debug
 
+
+# ---------------------------------------------------------------------------
+# Carregamento do modelo LLM
+# ---------------------------------------------------------------------------
 _pipeline = None
 _model_name: Optional[str] = None
+
 
 def load_model(model_name: str) -> bool:
     global _pipeline, _model_name
@@ -41,59 +51,219 @@ def load_model(model_name: str) -> bool:
         )
         _pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer, device=-1)
         _model_name = model_name
-        logger.info("Modelo carregado.")
+        logger.info("Modelo carregado com sucesso.")
         return True
     except Exception as e:
         logger.error("Falha ao carregar modelo: %s", e)
         return False
 
-def _build_prompt(price_data: dict, news_list: list[dict], price_trend_summary: str,
-                  decision_summary: str, indicators: dict) -> str:
-    """Prompt com chain-of-thought e exemplo few-shot."""
+
+# ---------------------------------------------------------------------------
+# Motor de score técnico
+# ---------------------------------------------------------------------------
+
+def _compute_technical_score(change_24h: float, rsi: Optional[float],
+                               avg_sentiment: float, price_trend_pct: float) -> tuple[float, list[str]]:
+    """
+    Calcula um score composto no intervalo [-1, 1].
+
+    Pesos:
+      - Variação 24h:        40%
+      - RSI:                 25%
+      - Sentimento notícias: 20%
+      - Tendência histórica: 15%
+
+    Retorna (score, lista de sinais para raciocínio).
+    """
+    signals = []
+    score = 0.0
+
+    # --- Variação 24h (peso 0.40) ---
+    # Mapeamento: >=+5% → +1, <=-5% → -1, linear no meio
+    change_score = max(-1.0, min(1.0, change_24h / 5.0))
+    score += change_score * 0.40
+
+    direction = "alta" if change_24h >= 0 else "queda"
+    signals.append(f"Variação 24h: {change_24h:+.2f}% ({direction}) → sinal {change_score:+.2f}")
+
+    # --- RSI (peso 0.25) ---
+    if rsi is not None:
+        if rsi >= 70:
+            rsi_score = -0.6    # sobrecompra → tendência de reversão
+            rsi_label = f"sobrecompra ({rsi:.1f}) → sinal negativo"
+        elif rsi <= 30:
+            rsi_score = +0.6    # sobrevenda → tendência de reversão pra cima
+            rsi_label = f"sobrevenda ({rsi:.1f}) → sinal positivo"
+        elif rsi >= 55:
+            rsi_score = +0.3    # momentum positivo
+            rsi_label = f"momentum positivo ({rsi:.1f})"
+        elif rsi <= 45:
+            rsi_score = -0.3    # momentum negativo
+            rsi_label = f"momentum negativo ({rsi:.1f})"
+        else:
+            rsi_score = 0.0
+            rsi_label = f"neutro ({rsi:.1f})"
+        score += rsi_score * 0.25
+        signals.append(f"RSI(14): {rsi_label} → sinal {rsi_score:+.2f}")
+    else:
+        signals.append("RSI: indisponível (ignorado no score)")
+
+    # --- Sentimento das notícias (peso 0.20) ---
+    # avg_sentiment já está em [-1, 1]
+    score += avg_sentiment * 0.20
+    sent_label = "positivo" if avg_sentiment > 0.2 else "negativo" if avg_sentiment < -0.2 else "neutro"
+    signals.append(f"Sentimento médio: {avg_sentiment:+.2f} ({sent_label}) → sinal {avg_sentiment * 0.20:+.2f}")
+
+    # --- Tendência histórica (peso 0.15) ---
+    trend_score = max(-1.0, min(1.0, price_trend_pct / 5.0))
+    score += trend_score * 0.15
+    trend_label = "alta" if price_trend_pct >= 0 else "queda"
+    signals.append(f"Tendência histórica: {price_trend_pct:+.2f}% ({trend_label}) → sinal {trend_score * 0.15:+.2f}")
+
+    return score, signals
+
+
+def _score_to_result(score: float, signals: list[str],
+                     change_24h: float, rsi: Optional[float]) -> tuple[str, str, str]:
+    """
+    Converte score em (tendência, recomendação, confiança).
+    A confiança mede o consenso entre os sinais principais.
+    """
+    # --- Tendência ---
+    if score >= 0.25:
+        trend = "Alta"
+    elif score <= -0.25:
+        trend = "Baixa"
+    else:
+        trend = "Neutra"
+
+    # --- Confiança (baseada na magnitude do score) ---
+    abs_score = abs(score)
+    if abs_score >= 0.55:
+        confidence = "Alta"
+    elif abs_score >= 0.30:
+        confidence = "Média"
+    else:
+        confidence = "Baixa"
+
+    # --- Recomendação contextualizada ---
+    if trend == "Alta":
+        if confidence == "Alta":
+            rec = "Sinal técnico forte de alta. Considere aumentar exposição com stop definido."
+        elif confidence == "Média":
+            rec = "Tendência de alta com sinais moderados. Mantenha posição, monitore resistências."
+        else:
+            rec = "Leve tendência positiva. Aguarde confirmação antes de agir."
+    elif trend == "Baixa":
+        if confidence == "Alta":
+            rec = "Pressão de venda intensa. Considere reduzir exposição ou proteger posição com stop."
+        elif confidence == "Média":
+            rec = "Tendência de queda moderada. Acompanhe suportes e evite novas entradas."
+        else:
+            rec = "Leve tendência negativa. Mantenha cautela e não amplie posição."
+    else:
+        if rsi is not None and rsi > 65:
+            rec = "Mercado lateral com RSI elevado. Risco de correção — evite compras no topo."
+        elif rsi is not None and rsi < 35:
+            rec = "Mercado lateral com RSI baixo. Possível oportunidade de compra gradual."
+        else:
+            rec = "Sem direção definida. Aguarde catalisador antes de operar."
+
+    return trend, rec, confidence
+
+
+# ---------------------------------------------------------------------------
+# Análise por regras (fallback ou modo padrão)
+# ---------------------------------------------------------------------------
+
+def analyze_with_rules(price_data: dict, news_list: list[dict],
+                        indicators: dict = None,
+                        price_trend_pct: float = 0.0) -> AnalysisResult:
+    """
+    Análise totalmente baseada em score técnico ponderado.
+    Nunca retorna 'Alta' apenas por sentimento quando o preço está caindo.
+    """
+    change = price_data.get("change_24h", 0.0)
+    rsi = (indicators or {}).get("rsi")
+
+    # sentimento médio real das notícias
+    sentiments = [n.get("sentiment", 0.0) for n in (news_list or [])]
+    avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0.0
+
+    score, signals = _compute_technical_score(change, rsi, avg_sentiment, price_trend_pct)
+    trend, rec, confidence = _score_to_result(score, signals, change, rsi)
+
+    rsi_text = f"{rsi:.1f}" if rsi is not None else "N/D"
+    reasoning = (
+        f"Score composto: {score:+.3f} | "
+        f"Var24h: {change:+.2f}% | RSI: {rsi_text} | "
+        f"Sentimento: {avg_sentiment:+.2f}\n"
+        + " | ".join(signals)
+    )
+
+    logger.info("Regras → tendência=%s confiança=%s score=%.3f", trend, confidence, score)
+    return AnalysisResult(trend, rec, confidence, reasoning, used_llm=False, score=score)
+
+
+# ---------------------------------------------------------------------------
+# Prompt para o LLM
+# ---------------------------------------------------------------------------
+
+def _build_prompt(price_data: dict, news_list: list[dict],
+                   price_trend_summary: str, decision_summary: str,
+                   indicators: dict, rules_result: AnalysisResult) -> str:
+    """
+    Prompt enriquecido com o pré-resultado das regras técnicas.
+    O LLM serve para refinar/justificar, não inventar tendência.
+    """
     sign = "+" if price_data["change_24h"] >= 0 else ""
-    # Calcular sentimento médio das notícias
-    avg_sentiment = sum(n.get('sentiment', 0) for n in news_list) / len(news_list) if news_list else 0
-    sent_text = f"Sentimento médio das notícias: {avg_sentiment:.2f} (de -1 a 1)"
-    # Notícias com sentimento
+    avg_sentiment = sum(n.get("sentiment", 0) for n in news_list) / len(news_list) if news_list else 0
+
     news_text = ""
     for i, n in enumerate(news_list, 1):
-        sent_emoji = "🟢" if n.get('sentiment', 0) > 0.2 else "🔴" if n.get('sentiment', 0) < -0.2 else "⚪"
-        news_text += f"{i}. {n['title']} {sent_emoji}\n"
-        if n.get('summary'):
-            news_text += f"   Resumo: {n['summary'][:150]}\n"
+        emoji = "🟢" if n.get("sentiment", 0) > 0.2 else "🔴" if n.get("sentiment", 0) < -0.2 else "⚪"
+        news_text += f"{i}. {n['title']} {emoji}\n"
+        if n.get("summary"):
+            news_text += f"   {n['summary'][:150]}\n"
 
-    indicators_text = ""
+    ind_text = ""
     if indicators:
-        rsi = indicators.get('rsi')
-        sma7 = indicators.get('sma7')
-        sma25 = indicators.get('sma25')
+        rsi = indicators.get("rsi")
+        sma7 = indicators.get("sma7")
+        sma25 = indicators.get("sma25")
         if rsi is not None:
-            indicators_text += f"RSI(14): {rsi:.2f} "
-            if rsi > 70:
-                indicators_text += "(sobrecompra) "
-            elif rsi < 30:
-                indicators_text += "(sobrevenda) "
+            state = "sobrecompra" if rsi > 70 else "sobrevenda" if rsi < 30 else "neutro"
+            ind_text += f"RSI(14): {rsi:.2f} ({state})\n"
         if sma7 and sma25:
-            cross = "acima" if sma7 > sma25 else "abaixo"
-            indicators_text += f"MM7 está {cross} da MM25. "
+            cross = "ACIMA" if sma7 > sma25 else "ABAIXO"
+            ind_text += f"MM7 está {cross} da MM25 (MM7={sma7:,.0f} | MM25={sma25:,.0f})\n"
 
     prompt = f"""<|system|>
-Você é Boris, um estrategista de investimentos especializado em Bitcoin. Analise os dados abaixo passo a passo e forneça sua recomendação no formato especificado.
+Você é Boris, estrategista quantitativo especializado em Bitcoin. Analise os dados abaixo com rigor técnico.
 
-FORMATO DE RESPOSTA OBRIGATÓRIO:
+REGRA FUNDAMENTAL: A análise técnica e a variação de preço têm prioridade absoluta sobre sentimento de notícias.
+Se o preço está caindo (-), a tendência NÃO pode ser "Alta" a menos que haja sinal técnico muito forte contrário (ex: RSI em sobrevenda extrema + volume crescente).
+
+FORMATO OBRIGATÓRIO DE RESPOSTA:
 TENDÊNCIA: [Alta/Baixa/Neutra]
 CONFIANÇA: [Alta/Média/Baixa]
-RECOMENDAÇÃO: [Uma frase curta e direta, com nível de preço sugerido se aplicável]
-ANÁLISE: [Primeiro, descreva os dados técnicos; depois, o sentimento do mercado; por fim, justifique sua tendência]
+RECOMENDAÇÃO: [Uma frase direta e objetiva]
+ANÁLISE: [Justificativa técnica em 2-3 frases: primeiro preço/indicadores, depois sentimento]
 
-Exemplo de análise anterior:
+Exemplo correto:
 ---
-TENDÊNCIA: Alta
+TENDÊNCIA: Baixa
 CONFIANÇA: Média
-RECOMENDAÇÃO: Mantenha posição, com alvo em $72.000.
-ANÁLISE: O preço rompeu resistência de $68.000 com volume acima da média. RSI em 65 indica momentum positivo. Notícias mostram adoção institucional. Portanto, tendência de alta.
+RECOMENDAÇÃO: Queda moderada com RSI ainda neutro. Evite novas compras, monitore suporte em $64.000.
+ANÁLISE: Preço recuou -1.8% nas últimas 24h com momentum negativo (RSI 44). Notícias levemente positivas não compensam a pressão vendedora. Tendência de baixa com confiança média.
 ---
 <|user|>
+## Pré-análise Técnica (regras quantitativas)
+Tendência calculada: {rules_result.trend}
+Score composto: {rules_result.score:+.3f} (intervalo -1 a +1)
+Confiança: {rules_result.confidence}
+Detalhes: {rules_result.reasoning}
+
 ## Dados de Mercado
 - Preço atual: ${price_data['price_usd']:,.2f} USD
 - Variação 24h: {sign}{price_data['change_24h']:.2f}%
@@ -101,199 +271,174 @@ ANÁLISE: O preço rompeu resistência de $68.000 com volume acima da média. RS
 - Market Cap: ${price_data['market_cap']:,.0f} USD
 
 ## Indicadores Técnicos
-{indicators_text}
+{ind_text if ind_text else 'Indisponível.'}
 
 ## Tendência Histórica
 {price_trend_summary}
 
-## Últimas Notícias
+## Notícias Recentes
 {news_text if news_text else 'Nenhuma notícia disponível.'}
-{sent_text}
+Sentimento médio das notícias: {avg_sentiment:+.2f} (de -1 a +1)
 
 ## Histórico de Decisões
 {decision_summary}
 
-Analise esses dados e forneça sua recomendação estratégica.
+Refine a pré-análise com seu julgamento e responda no formato acima.
 <|assistant|>
 """
     return prompt
 
+
 def _parse_llm_output(text: str) -> dict:
-    trend = "Neutra"
+    trend = None
     m = re.search(r"TENDÊNCIA:\s*(Alta|Baixa|Neutra)", text, re.IGNORECASE)
     if m:
         trend = m.group(1).capitalize()
+
     confidence = "Média"
-    m = re.search(r"CONFIANÇA:\s*(Alta|Média|Baixa)", text, re.IGNORECASE)
+    m = re.search(r"CONFIANÇA:\s*(Alta|Média|Baixa|Media)", text, re.IGNORECASE)
     if m:
-        confidence = m.group(1).capitalize()
-    recommendation = "Monitore o mercado."
+        confidence = m.group(1).capitalize().replace("Media", "Média")
+
+    recommendation = None
     m = re.search(r"RECOMENDAÇÃO:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
     if m:
         rec = m.group(1).strip()
         if rec:
             recommendation = rec
+
     reasoning = ""
     m = re.search(r"ANÁLISE:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
     if m:
         reasoning = m.group(1).strip()
-    return {"trend": trend, "confidence": confidence, "recommendation": recommendation, "reasoning": reasoning or text.strip()}
 
-def analyze_with_llm(price_data: dict, news_list: list[dict], price_trend_summary: str,
-                     decision_summary: str, model_name: str, indicators: dict = None,
-                     max_new_tokens: int = 400) -> Optional[AnalysisResult]:
+    return {
+        "trend": trend,
+        "confidence": confidence,
+        "recommendation": recommendation,
+        "reasoning": reasoning or text.strip(),
+    }
+
+
+def analyze_with_llm(price_data: dict, news_list: list[dict],
+                      price_trend_summary: str, decision_summary: str,
+                      model_name: str, indicators: dict,
+                      rules_result: AnalysisResult,
+                      max_new_tokens: int = 400) -> Optional[AnalysisResult]:
     if not load_model(model_name):
         return None
     try:
-        prompt = _build_prompt(price_data, news_list, price_trend_summary, decision_summary, indicators or {})
+        prompt = _build_prompt(
+            price_data, news_list, price_trend_summary,
+            decision_summary, indicators, rules_result
+        )
         outputs = _pipeline(
             prompt,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.3,
+            temperature=0.25,
             top_p=0.9,
-            repetition_penalty=1.1,
+            repetition_penalty=1.15,
             pad_token_id=_pipeline.tokenizer.eos_token_id,
         )
         generated = outputs[0]["generated_text"]
         response_text = generated[len(prompt):].strip()
         parsed = _parse_llm_output(response_text)
+
+        # Validação de sanidade: LLM não pode inverter tendência forte das regras
+        llm_trend = parsed.get("trend")
+        rules_trend = rules_result.trend
+        abs_score = abs(rules_result.score)
+
+        if llm_trend and abs_score >= 0.45 and llm_trend != rules_trend:
+            logger.warning(
+                "LLM sugeriu '%s' mas score técnico forte indica '%s' (score=%.3f). "
+                "Usando tendência técnica.", llm_trend, rules_trend, rules_result.score
+            )
+            llm_trend = rules_trend  # score técnico prevalece
+
         return AnalysisResult(
-            trend=parsed["trend"],
-            recommendation=parsed["recommendation"],
+            trend=llm_trend or rules_result.trend,
+            recommendation=parsed["recommendation"] or rules_result.recommendation,
             confidence=parsed["confidence"],
             reasoning=parsed["reasoning"],
             used_llm=True,
+            score=rules_result.score,
         )
     except Exception as e:
         logger.error("Erro na análise LLM: %s", e)
         return None
 
-def analyze_with_rules(price_data: dict, news_list: list[dict], indicators: dict = None) -> AnalysisResult:
-    """Regras melhoradas com RSI e sentimento real."""
-    change = price_data.get("change_24h", 0.0)
-    # Sentimento médio das notícias
-    sentiments = [n.get('sentiment', 0) for n in news_list] if news_list else [0]
-    avg_sentiment = sum(sentiments) / len(sentiments) if sentiments else 0
 
-    rsi = indicators.get('rsi') if indicators else None
-
-    # Decisão baseada em regras mais sofisticadas
-    if change > 5.0:
-        trend, confidence = "Alta", "Alta"
-        rec = "Forte alta em andamento. Considere manter ou aumentar exposição gradualmente."
-    elif change > 2.0:
-        if avg_sentiment > 0.2 and (rsi is None or rsi < 70):
-            trend, confidence = "Alta", "Média"
-            rec = "Alta moderada com sentimento positivo. Mantenha posição."
-        else:
-            trend, confidence = "Neutra", "Média"
-            rec = "Alta moderada, mas sentimento neutro ou RSI elevado. Cautela."
-    elif change < -5.0:
-        trend, confidence = "Baixa", "Alta"
-        rec = "Forte queda. Considere reduzir exposição ou aguardar estabilização."
-    elif change < -2.0:
-        if avg_sentiment < -0.2 and (rsi is None or rsi > 30):
-            trend, confidence = "Baixa", "Média"
-            rec = "Correção com sentimento negativo. Acompanhe suportes."
-        else:
-            trend, confidence = "Neutra", "Média"
-            rec = "Queda moderada, mas sem pânico. Mantenha posição."
-    else:
-        if avg_sentiment > 0.2 and (rsi is None or rsi < 70):
-            trend, confidence = "Alta", "Baixa"
-            rec = "Mercado lateral com notícias favoráveis. Leve tendência de alta."
-        elif avg_sentiment < -0.2 and (rsi is None or rsi > 30):
-            trend, confidence = "Baixa", "Baixa"
-            rec = "Mercado lateral com notícias negativas. Reduza exposição."
-        else:
-            trend, confidence = "Neutra", "Alta"
-            rec = "Mercado sem direção definida. Aguarde catalisadores."
-
-    rsi_text = f"{rsi:.2f}" if rsi is not None else "N/A"
-
-    reasoning = (
-        f"Regras: variação {change:+.2f}%, "
-        f"sentimento médio {avg_sentiment:+.2f}, "
-        f"RSI={rsi_text}."
-)
-    return AnalysisResult(trend, rec, confidence, reasoning, used_llm=False)
-
-import time
-import random
-import os
-
-# memória simples em runtime
-_last_llm_time = 0
+# ---------------------------------------------------------------------------
+# Controle de uso do LLM (cooldown + gatilhos)
+# ---------------------------------------------------------------------------
+_last_llm_time = 0.0
 
 
 def _should_use_llm(price_data: dict, indicators: dict) -> bool:
-    """
-    Decide se vale a pena usar LLM baseado no mercado.
-    """
-    change = abs(price_data.get("change_24h", 0))
-
-    # movimento forte
-    if change >= 2.5:
+    """Aciona LLM em situações de mercado relevantes."""
+    change = abs(price_data.get("change_24h", 0.0))
+    if change >= 2.0:
         return True
-
-    # RSI extremo
-    if indicators:
-        rsi = indicators.get("rsi")
-        if rsi is not None and (rsi >= 70 or rsi <= 30):
-            return True
-
+    rsi = (indicators or {}).get("rsi")
+    if rsi is not None and (rsi >= 68 or rsi <= 32):
+        return True
     return False
 
 
 def _cooldown_ok(cooldown_seconds: int) -> bool:
     global _last_llm_time
     now = time.time()
-
     if now - _last_llm_time >= cooldown_seconds:
         _last_llm_time = now
         return True
-
     return False
 
 
-def run_analysis(price_data: dict, news_list: list[dict], price_trend_summary: str,
-                 decision_summary: str, model_name: str, indicators: dict = None,
-                 max_new_tokens: int = 400) -> AnalysisResult:
+# ---------------------------------------------------------------------------
+# Ponto de entrada principal
+# ---------------------------------------------------------------------------
 
-    #LLM totalmente desligado
+def run_analysis(price_data: dict, news_list: list[dict],
+                  price_trend_summary: str, decision_summary: str,
+                  model_name: str, indicators: dict = None,
+                  max_new_tokens: int = 400,
+                  price_trend_pct: float = 0.0) -> AnalysisResult:
+    """
+    Executa análise completa:
+    1. Score técnico ponderado (sempre)
+    2. LLM para refinamento (quando mercado justifica)
+    3. Validação de sanidade entre LLM e score técnico
+    """
+    indicators = indicators or {}
+
+    # 1. Análise técnica base (sempre executada)
+    rules_result = analyze_with_rules(price_data, news_list, indicators, price_trend_pct)
+
+    # 2. LLM desativado
     if model_name in (None, "", "none", "None"):
-        logger.info("LLM desativado. Usando regras.")
-        return analyze_with_rules(price_data, news_list, indicators)
+        logger.info("LLM desativado. Usando análise técnica.")
+        return rules_result
 
-    #parâmetros configuráveis
-    USE_LLM_PROB = float(os.getenv("LLM_PROBABILITY", "0.3"))  # 30%
-    COOLDOWN = int(os.getenv("LLM_COOLDOWN_SECONDS", "3600"))  # 1h
+    # 3. Decidir uso do LLM — mercado relevante + cooldown (sem sorteio)
+    COOLDOWN = int(os.getenv("LLM_COOLDOWN_SECONDS", "9000"))  # padrão: 2h30
 
-    #decisão inteligente
-    use_llm = False
-
-    if _should_use_llm(price_data, indicators):
-        if random.random() < USE_LLM_PROB:
-            if _cooldown_ok(COOLDOWN):
-                use_llm = True
+    use_llm = (
+        _should_use_llm(price_data, indicators)
+        and _cooldown_ok(COOLDOWN)
+    )
 
     if use_llm:
-        logger.info("Usando LLM (evento + probabilidade + cooldown)")
-        try:
-            result = analyze_with_llm(
-                price_data, news_list, price_trend_summary,
-                decision_summary, model_name, indicators, max_new_tokens
-            )
+        logger.info("Acionando LLM para refinamento (score_base=%.3f)", rules_result.score)
+        llm_result = analyze_with_llm(
+            price_data, news_list, price_trend_summary,
+            decision_summary, model_name, indicators,
+            rules_result, max_new_tokens
+        )
+        if llm_result:
+            logger.info("LLM: tendência=%s confiança=%s", llm_result.trend, llm_result.confidence)
+            return llm_result
+        logger.warning("LLM falhou, usando análise técnica.")
 
-            if result:
-                logger.info("LLM: tendência=%s confiança=%s",
-                            result.trend, result.confidence)
-                return result
-
-        except Exception as e:
-            logger.warning("Erro no LLM: %s", e)
-
-    #fallback leve
-    logger.info("Usando regras.")
-    return analyze_with_rules(price_data, news_list, indicators)
+    return rules_result

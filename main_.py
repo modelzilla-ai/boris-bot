@@ -104,7 +104,7 @@ async def perform_analysis(chat_id: str = None, is_alert: bool = False) -> Analy
         memory.add_news(news_list)
 
     # 4. Indicadores técnicos
-    ohlc = fetch_bitcoin_ohlc(days=14)
+    ohlc = fetch_bitcoin_ohlc(days=7)
     indicators = compute_indicators(ohlc) if (ohlc is not None and not ohlc.empty) else {}
 
     # 5. Resumos da memória
@@ -159,82 +159,6 @@ async def _send_message(chat_id: str, text: str, photo: BytesIO = None):
         logger.error("Erro ao enviar mensagem: %s", e)
 
 
-
-def explain_indicators(indicators: dict, score: float) -> str:
-    """
-    Converte os indicadores técnicos em linguagem natural acessível.
-    Retorna um parágrafo curto para exibir no relatório do Telegram.
-    """
-    parts = []
-    rsi = indicators.get("rsi")
-    sma7 = indicators.get("sma7")
-    sma25 = indicators.get("sma25")
-
-    # --- RSI ---
-    if rsi is not None:
-        if rsi >= 70:
-            parts.append(
-                f"O RSI em {rsi:.0f} indica sobrecompra — o Bitcoin subiu rápido demais "
-                f"e pode estar perto de uma correção."
-            )
-        elif rsi <= 30:
-            parts.append(
-                f"O RSI em {rsi:.0f} indica sobrevenda — o preço caiu muito em pouco tempo "
-                f"e pode estar perto de uma recuperação."
-            )
-        elif rsi >= 55:
-            parts.append(
-                f"O RSI em {rsi:.0f} mostra momentum positivo: compradores no comando, "
-                f"mas ainda longe de sobrecompra."
-            )
-        elif rsi <= 45:
-            parts.append(
-                f"O RSI em {rsi:.0f} mostra momentum negativo: vendedores levemente no controle, "
-                f"sem força definida."
-            )
-        else:
-            parts.append(
-                f"O RSI em {rsi:.0f} está no meio do campo — nem compradores nem vendedores "
-                f"dominam o momento."
-            )
-
-    # --- Médias móveis ---
-    if sma7 is not None and sma25 is not None:
-        diff_pct = ((sma7 - sma25) / sma25) * 100
-        if sma7 > sma25:
-            parts.append(
-                f"A média dos últimos 7 dias está acima da média dos últimos 25 "
-                f"({diff_pct:+.1f}%) — sinal de que o curto prazo está mais forte que o médio prazo."
-            )
-        else:
-            parts.append(
-                f"A média dos últimos 7 dias está abaixo da média dos últimos 25 "
-                f"({diff_pct:+.1f}%) — o curto prazo está mais fraco que o médio prazo."
-            )
-
-    # --- Score composto ---
-    abs_score = abs(score)
-    if abs_score < 0.15:
-        parts.append(
-            f"O score composto de {score:+.3f} é praticamente zero: "
-            f"os sinais se cancelam e o mercado não tem direção clara."
-        )
-    elif abs_score < 0.35:
-        direction = "positiva" if score > 0 else "negativa"
-        parts.append(
-            f"O score de {score:+.3f} aponta uma leve pressão {direction}, "
-            f"insuficiente para uma tendência forte."
-        )
-    else:
-        direction = "alta" if score > 0 else "baixa"
-        parts.append(
-            f"O score de {score:+.3f} confirma tendência de {direction} "
-            f"com sinais técnicos em consenso."
-        )
-
-    return " ".join(parts)
-
-
 def _build_report(price_data: dict, news_list: list[dict],
                    result: AnalysisResult, indicators: dict, is_alert: bool) -> str:
     now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
@@ -255,8 +179,8 @@ def _build_report(price_data: dict, news_list: list[dict],
         ind_parts.append(f"MM7 {cross} da MM25")
     ind_text = " | ".join(ind_parts) if ind_parts else "Indisponível"
 
+    # Score interno (debug leve)
     score_text = f"Score: {result.score:+.3f}"
-    ind_explanation = explain_indicators(indicators, result.score)
 
     alert_header = "<b>🚨 ALERTA — VARIAÇÃO SIGNIFICATIVA</b>\n\n" if is_alert else ""
 
@@ -276,14 +200,13 @@ def _build_report(price_data: dict, news_list: list[dict],
         f"<b>Variação 24h:</b> <code>{sign}{price_data['change_24h']:.2f}%</code>\n"
         f"<b>Volume 24h:</b> <code>${price_data['volume_24h']:,.0f}</code>\n\n"
         f"<b>Indicadores:</b> {ind_text}\n"
-        f"<b>{score_text}</b>\n"
-        f"<i>{ind_explanation}</i>\n\n"
+        f"<b>{score_text}</b>\n\n"
         f"<b>Notícias:</b>\n{news_block}\n\n"
         f"<b>Tendência:</b> {trend_label}\n"
         f"<b>Confiança:</b> {result.confidence}\n\n"
         f"<b>Recomendação:</b>\n<i>{result.recommendation}</i>\n\n"
         f"<i>Análise via {mode_label} | Boris v3.0</i>\n"
-        f"<i>Programado por <b>Eduardo Araujo (@lalo_arauxo)</b> - meu painho 😊.</i>"
+        f"<i>Programado por <b>Eduardo Araujo (@lalo_araujo)</b> 😊</i>"
     )
     return report
 
@@ -317,7 +240,7 @@ async def cmd_preco(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not price:
         await update.message.reply_text("❌ Erro ao obter preço.")
         return
-    ohlc = fetch_bitcoin_ohlc(days=14)
+    ohlc = fetch_bitcoin_ohlc(days=7)
     indicators = compute_indicators(ohlc) if (ohlc is not None and not ohlc.empty) else {}
     text = format_price_summary(price)
     rsi = indicators.get("rsi")
@@ -409,7 +332,7 @@ def _run_test():
         logger.error("❌ Falha ao obter preço.")
     news = fetch_bitcoin_news(3)
     logger.info("✅ Notícias: %d obtidas", len(news))
-    ohlc = fetch_bitcoin_ohlc(14)
+    ohlc = fetch_bitcoin_ohlc(7)
     if ohlc is not None:
         ind = compute_indicators(ohlc)
         logger.info("✅ OHLC OK | RSI=%.1f | MM7=%.0f | MM25=%.0f",
